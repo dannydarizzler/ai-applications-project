@@ -1,0 +1,5 @@
+[server]
+maxUploadSize = 10
+
+[runner]
+fastReruns = false
