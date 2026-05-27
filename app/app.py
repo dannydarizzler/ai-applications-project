@@ -816,12 +816,28 @@ try:
 
             st.subheader('Model Performance')
             perf_df = pd.DataFrame({
-                'Block':  ['CV (ResNet18)', 'ML (Random Forest)', 'NLP (RAG)'],
-                'Task':   ['Brand Classification', 'Price Prediction (CHF)', 'Question Answering'],
-                'Metric': ['Top-1 Accuracy', 'R² Score', 'Retrieval Model'],
-                'Result': ['82.44 %', '0.91', 'all-MiniLM-L6-v2 + FAISS'],
+                'Block':  ['CV (ResNet18)', 'CV (ResNet18)', 'ML (Random Forest)', 'ML (Random Forest)', 'NLP (RAG)'],
+                'Task':   ['Brand Classification', 'Brand Classification', 'Price Prediction (CHF)', 'Price Prediction (CHF)', 'Question Answering'],
+                'Metric': ['Top-1 Accuracy', 'Top-3 Accuracy', 'R² Score', 'RMSE', 'Knowledge Base'],
+                'Result': ['82.44 %', '90.36 %', '0.91', '3.26 Lakh (~CHF 3,590)', '50+ documents, FAISS IndexFlatIP'],
             })
             st.dataframe(perf_df, use_container_width=True, hide_index=True)
+
+            st.subheader('Known Limitations')
+            st.markdown(
+                '- Price data is based on the Indian market (not Swiss/European market prices)\n'
+                '- CV model recognizes only 42 car brands trained on US market images\n'
+                '- RAG knowledge base contains ~50 documents, limited domain knowledge\n'
+                '- Price predictions work best for Indian car brands (Maruti, Hyundai, Honda)'
+            )
+
+            st.subheader('Ethical Considerations')
+            st.markdown(
+                '- Prices shown are estimates only, not financial advice\n'
+                '- Model may be biased toward more common brands in training data\n'
+                '- User uploaded images are not stored or used for training\n'
+                '- Currency conversion (INR → CHF) uses approximate fixed rate'
+            )
 
         with col_right:
             st.subheader('Technology Stack')
