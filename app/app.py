@@ -65,10 +65,148 @@ if not os.environ.get('OPENAI_API_KEY'):
 # ── Page config — MUST be the very first Streamlit call ─────────────────────
 st.set_page_config(
     page_title='Car Advisor AI',
-    page_icon='🚗',
+    page_icon='🏎️',
     layout='wide',
     initial_sidebar_state='expanded',
 )
+
+st.markdown("""
+<style>
+/* ── Hide/fix Streamlit top header ── */
+header[data-testid="stHeader"] {
+    background-color: #f0f4f0 !important;
+    border-bottom: none !important;
+}
+#MainMenu {visibility: hidden;}
+footer {visibility: hidden;}
+
+/* ── Background ── */
+.stApp {
+    background-color: #f0f4f0;
+    color: #1a1a1a;
+}
+
+/* ── Sidebar ── */
+[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #1a3a1a 0%, #2d5a2d 100%);
+    border-right: 3px solid #c9a84c;
+}
+[data-testid="stSidebar"] p,
+[data-testid="stSidebar"] li,
+[data-testid="stSidebar"] span,
+[data-testid="stSidebar"] label {
+    color: #f0f0f0 !important;
+}
+[data-testid="stSidebar"] h2,
+[data-testid="stSidebar"] h3 {
+    color: #c9a84c !important;
+}
+
+/* ── Titles ── */
+h1 {
+    color: #c9a84c !important;
+    font-family: 'Arial Black', sans-serif;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    border-bottom: 3px solid #2d5a2d;
+    padding-bottom: 8px;
+}
+h2, h3 {
+    color: #2d5a2d !important;
+    font-weight: bold !important;
+}
+
+/* ── Buttons ── */
+.stButton > button {
+    background: linear-gradient(90deg, #2d5a2d, #3d7a3d) !important;
+    color: #c9a84c !important;
+    border: 2px solid #c9a84c !important;
+    border-radius: 6px !important;
+    font-weight: bold !important;
+    letter-spacing: 1px !important;
+    transition: all 0.3s ease !important;
+}
+.stButton > button:hover {
+    background: linear-gradient(90deg, #c9a84c, #d4b86a) !important;
+    color: #1a3a1a !important;
+    box-shadow: 0 4px 15px rgba(201,168,76,0.4) !important;
+    transform: translateY(-2px) !important;
+}
+
+/* ── Tabs ── */
+.stTabs [data-baseweb="tab-list"] {
+    background-color: #e8f0e8 !important;
+    border-bottom: 3px solid #2d5a2d !important;
+    gap: 4px;
+}
+.stTabs [data-baseweb="tab"] {
+    color: #555555 !important;
+    font-weight: bold !important;
+    border-radius: 6px 6px 0 0 !important;
+    transition: all 0.3s ease !important;
+    padding: 10px 20px !important;
+}
+.stTabs [data-baseweb="tab"]:hover {
+    color: #c9a84c !important;
+    background-color: #2d5a2d !important;
+    transform: translateY(-2px) !important;
+}
+.stTabs [aria-selected="true"] {
+    color: #c9a84c !important;
+    background-color: #2d5a2d !important;
+    border-bottom: 3px solid #c9a84c !important;
+}
+
+/* ── Metrics ── */
+[data-testid="stMetric"] {
+    background: white;
+    border: 2px solid #2d5a2d;
+    border-top: 4px solid #c9a84c;
+    border-radius: 10px;
+    padding: 15px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+}
+[data-testid="stMetricLabel"] {
+    color: #2d5a2d !important;
+    font-weight: bold !important;
+}
+[data-testid="stMetricValue"] {
+    color: #c9a84c !important;
+    font-weight: bold !important;
+}
+
+/* ── Expander ── */
+[data-testid="stExpander"] {
+    background-color: white !important;
+    border: 1px solid #2d5a2d !important;
+    border-radius: 8px !important;
+}
+
+/* ── Divider ── */
+hr {
+    border-color: #2d5a2d !important;
+    opacity: 0.3;
+}
+
+/* ── File uploader ── */
+[data-testid="stFileUploader"] {
+    background-color: white !important;
+    border: 2px dashed #c9a84c !important;
+    border-radius: 10px !important;
+}
+
+/* ── Progress bars ── */
+.stProgress > div > div {
+    background: linear-gradient(90deg, #2d5a2d, #c9a84c) !important;
+}
+
+/* ── Info boxes ── */
+[data-testid="stInfo"] {
+    background-color: #e8f4e8 !important;
+    border-left: 4px solid #2d5a2d !important;
+}
+</style>
+""", unsafe_allow_html=True)
 
 # ── API key — st.secrets only tried if a secrets file actually exists ────────
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
@@ -299,16 +437,16 @@ with st.sidebar:
         'Image classification uses the **Auto_Bilder** dataset (42 car brands).  \n'
         'Price prediction uses the **Indian Used Car Market** dataset (~5,700 listings).'
     )
-    st.caption('💱 Prices converted from Indian market data to CHF')
+    st.caption('Prices converted from Indian market data to CHF')
     st.divider()
-    st.caption('ZHAW AI Applications Project · 2026')
+   
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Page header
 # ═══════════════════════════════════════════════════════════════════════════
 
-st.title('🚗 Car Advisor AI')
+st.title('🏎️ Car Advisor AI')
 st.markdown('*AI-powered brand recognition, price prediction, and buying advice — all in one place.*')
 st.divider()
 
@@ -655,7 +793,7 @@ try:
                 'This is a ZHAW university AI course project that demonstrates how three different '
                 'AI techniques can be combined into one coherent, end-to-end pipeline.\n\n'
                 'The application answers a common real-world question:  \n'
-                '**"I have a car photo and some basic specs — what brand is it, '
+                '**"I have a car photo and some basic specifications — what brand is it, '
                 'what is it worth, and should I buy it?"**'
             )
 
@@ -718,8 +856,8 @@ try:
 
             st.subheader('Dataset Sources')
             st.markdown(
-                '- **Image data:** Auto_Bilder (Stanford Cars-style), 42 brands  \n'
-                '- **Tabular data:** Indian Used Car Market, ~5,700 listings  \n'
+                '- **Image data:** https://www.kaggle.com/datasets/prondeau/the-car-connection-picture-dataset  \n'
+                '- **Tabular data:** https://www.kaggle.com/datasets/tunguz/used-car-auction-prices  \n'
                 '- **Knowledge base:** Built from dataset statistics + car-buying tips'
             )
 
@@ -727,6 +865,7 @@ try:
         st.subheader('Author & Course')
         st.markdown(
             '**Course:** AI Applications — ZHAW School of Engineering  \n'
+            '**Author:** Daniele Magnano  \n'
             '**Year:** 2026  \n'
             '**Goal:** Demonstrate an end-to-end AI pipeline (image → brand → price → explanation)'
         )
