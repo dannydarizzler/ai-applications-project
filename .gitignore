@@ -1,6 +1,4 @@
-data/
-models/
+data/raw/
 __pycache__/
 .env
-*.pkl
 *.h5
