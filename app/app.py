@@ -594,7 +594,7 @@ try:
                     seats_options = [2, 4, 5, 6, 7, 8]
                     nearest_seats = min(seats_options, key=lambda s: abs(s - bd['seats']))
 
-                    year      = st.slider('Manufacturing Year', 2000, 2024, bd['year'], step=1)
+                    year      = st.slider('Manufacturing Year', 1980, 2026, bd['year'], step=1)
                     km_driven = st.slider('Kilometers Driven', 0, 300_000, bd['km_driven'],
                                           step=1_000, format='%d km')
                     owner_type = st.selectbox('Owner Type',
