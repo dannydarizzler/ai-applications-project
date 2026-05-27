@@ -241,6 +241,47 @@ def get_brand_list() -> list:
     return names
 
 
+def get_brand_defaults(brand: str) -> dict:
+    """
+    Return median spec values for a given brand from the training dataset.
+    Uses the saved scaler to inverse-transform scaled columns back to real units.
+    Falls back to dataset-wide medians if the brand has no matching rows.
+    """
+    _FALLBACK = {
+        'year': 2018, 'km_driven': 50_000,
+        'mileage': 18.5, 'engine': 1_497.0, 'power': 108.5, 'seats': 5,
+    }
+    try:
+        import joblib as _jl
+        df = pd.read_csv(dp('used_cars_clean.csv'))
+        scaler = _jl.load(mp('scaler.pkl'))
+
+        brand_list = get_brand_list()
+        df['Brand_Name'] = df['Brand'].apply(
+            lambda x: brand_list[int(x)] if int(x) < len(brand_list) else ''
+        )
+
+        subset = df[df['Brand_Name'].str.lower() == brand.lower()]
+        src = subset if len(subset) >= 5 else df
+
+        # Scaler input order: [km_driven, engine, power, mileage, car_age]
+        scaled_med = src[['Kilometers_Driven', 'Engine', 'Power', 'Mileage', 'Car_Age']] \
+                        .median().values.reshape(1, -1)
+        km, engine, power, mileage, car_age = scaler.inverse_transform(scaled_med)[0]
+        seats = float(src['Seats'].median())
+
+        return {
+            'year':      int(max(2000, min(2024, round(2024 - car_age)))),
+            'km_driven': int(round(km / 1_000) * 1_000),
+            'mileage':   round(max(5.0,  min(40.0,   mileage)), 1),
+            'engine':    float(round(max(500.0, min(5_000.0, engine)) / 50) * 50),
+            'power':     float(round(max(30.0,  min(600.0,  power))  / 5)  * 5),
+            'seats':     int(round(seats)),
+        }
+    except Exception:
+        return _FALLBACK
+
+
 def cv_predict(image: Image.Image, top_k: int = 3):
     """
     Load ResNet18, run inference, return (predictions, model).
@@ -538,27 +579,42 @@ try:
                     cv_brand    = st.session_state.get('cv_brand', ml_brands[0])
                     default_idx = ml_brands.index(cv_brand) if cv_brand in ml_brands else 0
                     brand_sel   = st.selectbox('Brand', ml_brands, index=default_idx)
-                    year        = st.slider('Manufacturing Year', 2000, 2024, 2018, step=1)
-                    km_driven   = st.slider('Kilometers Driven', 0, 300_000, 50_000, step=1_000,
-                                            format='%d km')
-                    owner_type  = st.selectbox('Owner Type',
-                                               ['First', 'Second', 'Third', 'Fourth & Above'])
+
+                    # Reload defaults whenever brand selection changes
+                    cached_key = st.session_state.get('brand_defaults_key')
+                    if cached_key != brand_sel:
+                        st.session_state['brand_defaults'] = get_brand_defaults(brand_sel)
+                        st.session_state['brand_defaults_key'] = brand_sel
+                    bd = st.session_state['brand_defaults']
+
+                    seats_options = [2, 4, 5, 6, 7, 8]
+                    nearest_seats = min(seats_options, key=lambda s: abs(s - bd['seats']))
+
+                    year      = st.slider('Manufacturing Year', 2000, 2024, bd['year'], step=1)
+                    km_driven = st.slider('Kilometers Driven', 0, 300_000, bd['km_driven'],
+                                          step=1_000, format='%d km')
+                    owner_type = st.selectbox('Owner Type',
+                                              ['First', 'Second', 'Third', 'Fourth & Above'])
 
                 with col2:
                     st.markdown('**Fuel & Transmission**')
                     fuel_type    = st.selectbox('Fuel Type',
                                                 ['Petrol', 'Diesel', 'CNG', 'LPG', 'Electric'])
                     transmission = st.selectbox('Transmission', ['Manual', 'Automatic'])
-                    seats        = st.selectbox('Seats', [2, 4, 5, 6, 7, 8], index=2)
+                    seats        = st.selectbox('Seats', seats_options,
+                                                index=seats_options.index(nearest_seats))
 
                 with col3:
                     st.markdown('**Engine Specs**')
-                    mileage = st.number_input('Mileage (kmpl)', 5.0, 40.0, 18.5, step=0.5,
-                                              help='Fuel efficiency in km per litre.')
-                    engine  = st.number_input('Engine CC', 500.0, 5_000.0, 1_497.0, step=50.0,
-                                              help='Displacement in cubic centimetres.')
-                    power   = st.number_input('Power (BHP)', 30.0, 600.0, 108.5, step=5.0,
-                                              help='Maximum power in brake horsepower.')
+                    mileage = st.number_input('Mileage (kmpl)', 5.0, 40.0,
+                                              float(max(5.0, min(40.0, bd['mileage']))),
+                                              step=0.5, help='Fuel efficiency in km per litre.')
+                    engine  = st.number_input('Engine CC', 500.0, 5_000.0,
+                                              float(max(500.0, min(5_000.0, bd['engine']))),
+                                              step=50.0, help='Displacement in cubic centimetres.')
+                    power   = st.number_input('Power (BHP)', 30.0, 600.0,
+                                              float(max(30.0, min(600.0, bd['power']))),
+                                              step=5.0, help='Maximum power in brake horsepower.')
 
                 if st.button('💰 Estimate Price', type='primary', use_container_width=True):
                     try:
