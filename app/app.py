@@ -199,6 +199,10 @@ hr {
 .stProgress > div > div {
     background: linear-gradient(90deg, #2d5a2d, #c9a84c) !important;
 }
+.stProgress p {
+    color: #2d5a2d !important;
+    font-weight: 600 !important;
+}
 
 /* ── Info boxes ── */
 [data-testid="stInfo"] {
