@@ -1,6 +1,14 @@
 # ═══════════════════════════════════════════════════════════════════════════
 # app/app.py  –  Car Advisor AI  (ZHAW AI Applications Project)
 # ═══════════════════════════════════════════════════════════════════════════
+#
+# Memory strategy
+# ───────────────
+# CV  (torch/ResNet18)       : loaded inside cv_predict(), deleted by caller
+# ML  (sklearn/joblib)       : loaded inside ml_predict(), deleted before return
+# RAG (faiss + transformers) : loaded once on first need, kept in session_state
+# Rule: CV and RAG are never in memory at the same time
+# ═══════════════════════════════════════════════════════════════════════════
 
 import gc
 import os
@@ -10,36 +18,51 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
-import plotly.graph_objects as go
 from PIL import Image
 from dotenv import load_dotenv
 
+# Env vars must come before any torch import
+os.environ.setdefault('PYTORCH_ENABLE_MPS_FALLBACK', '1')
+os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
+
+# Import torch NOW at startup so it is fully initialised before Streamlit's
+# file-watcher scans torch.classes.__path__.  On Apple Silicon, the watcher
+# access corrupts torch's C++ class registry if torch is only half-loaded,
+# causing a fatal segfault the first time cv_predict() tries to use it.
+import torch
+torch.set_default_device('cpu')   # all ops default to CPU — no MPS usage anywhere
+
 warnings.filterwarnings('ignore')
+print("App starting...", flush=True)
 
-# Graceful FAISS import — both 'faiss' and 'faiss-cpu' install under the same 'faiss' namespace
-try:
-    import faiss as _faiss_lib
-    FAISS_AVAILABLE = True
-except ImportError:
-    _faiss_lib = None
-    FAISS_AVAILABLE = False
-
-# ── Path helpers ────────────────────────────────────────────────────────────
-APP_DIR    = os.path.dirname(os.path.abspath(__file__))
-MODELS_DIR = os.path.normpath(os.path.join(APP_DIR, '..', 'models'))
-DATA_DIR   = os.path.normpath(os.path.join(APP_DIR, '..', 'data'))
+# ── Paths ────────────────────────────────────────────────────────────────────
+# Auto-detect layout:
+#   Local  : app.py lives in project/app/ → models at project/models/   (../models)
+#   HF     : app.py lives in project/     → models at project/models/   (models)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODELS_DIR = (
+    os.path.join(BASE_DIR, 'models')
+    if os.path.isdir(os.path.join(BASE_DIR, 'models'))
+    else os.path.normpath(os.path.join(BASE_DIR, '..', 'models'))
+)
+DATA_DIR = (
+    os.path.join(BASE_DIR, 'data')
+    if os.path.isdir(os.path.join(BASE_DIR, 'data'))
+    else os.path.normpath(os.path.join(BASE_DIR, '..', 'data'))
+)
 
 def mp(filename: str) -> str:
     return os.path.join(MODELS_DIR, filename)
 
-def dp(*parts: str) -> str:
-    return os.path.join(DATA_DIR, *parts)
+def dp(filename: str) -> str:
+    return os.path.join(DATA_DIR, 'processed', filename)
 
-# Load .env (OPENAI_API_KEY)
-load_dotenv(os.path.join(APP_DIR, '..', '.env'))
-OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
+# ── Load .env (no Streamlit calls yet) ──────────────────────────────────────
+load_dotenv(os.path.join(BASE_DIR, '.env'))
+if not os.environ.get('OPENAI_API_KEY'):
+    load_dotenv(os.path.join(BASE_DIR, '..', '.env'))  # also try project root
 
-# ── Page config (must be FIRST Streamlit call) ──────────────────────────────
+# ── Page config — MUST be the very first Streamlit call ─────────────────────
 st.set_page_config(
     page_title='Car Advisor AI',
     page_icon='🚗',
@@ -47,132 +70,52 @@ st.set_page_config(
     initial_sidebar_state='expanded',
 )
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Cached model loaders
-# ═══════════════════════════════════════════════════════════════════════════
-
-def load_cv_model():
-    """Load ResNet18 in eval mode. Called lazily on button click; caller must del the model."""
-    try:
-        import torch
-        import torch.nn as nn
-        from torchvision import models as tv_models
-
-        weights_path = mp('car_brand_classifier.pth')
-        names_path   = mp('class_names.json')
-
-        if not os.path.exists(weights_path):
-            return None, None, 'car_brand_classifier.pth not found — run 02_cv_model.ipynb first.'
-        if not os.path.exists(names_path):
-            return None, None, 'class_names.json not found — run 02_cv_model.ipynb first.'
-
-        with open(names_path) as f:
-            class_names = json.load(f)
-
-        device = torch.device('cpu')
+# ── API key — st.secrets only tried if a secrets file actually exists ────────
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
+if not OPENAI_API_KEY:
+    _secrets_candidates = [
+        os.path.expanduser('~/.streamlit/secrets.toml'),
+        os.path.join(BASE_DIR, '.streamlit', 'secrets.toml'),
+        os.path.join(BASE_DIR, '..', '.streamlit', 'secrets.toml'),
+    ]
+    if any(os.path.exists(p) for p in _secrets_candidates):
         try:
-            net = tv_models.resnet18(weights=tv_models.ResNet18_Weights.DEFAULT)
-        except AttributeError:
-            net = tv_models.resnet18(pretrained=False)
-
-        net.fc = nn.Linear(net.fc.in_features, len(class_names))
-        net.load_state_dict(torch.load(weights_path, map_location=device))
-        net.to(device).eval()
-        return net, class_names, None
-    except Exception as exc:
-        return None, None, str(exc)
-
-
-@st.cache_resource(show_spinner='Loading ML models…')
-def load_ml_models():
-    """Load price predictor, scaler, brand encoder, feature columns.
-    Returns (predictor, scaler, brand_encoder, feature_columns, error)."""
-    try:
-        import joblib
-
-        for fname in ('price_predictor.pkl', 'scaler.pkl', 'brand_encoder.pkl'):
-            if not os.path.exists(mp(fname)):
-                return None, None, None, None, f'{fname} not found — run 03_ml_numeric.ipynb first.'
-
-        fc_path = dp('processed', 'feature_columns.json')
-        if not os.path.exists(fc_path):
-            return None, None, None, None, 'feature_columns.json not found — run 01_eda.ipynb first.'
-
-        predictor     = joblib.load(mp('price_predictor.pkl'))
-        scaler        = joblib.load(mp('scaler.pkl'))
-        brand_encoder = joblib.load(mp('brand_encoder.pkl'))
-        with open(fc_path) as f:
-            feature_columns = json.load(f)
-
-        return predictor, scaler, brand_encoder, feature_columns, None
-    except Exception as exc:
-        return None, None, None, None, str(exc)
-
-
-@st.cache_resource(show_spinner='Loading RAG components…')
-def load_rag_components():
-    """Load FAISS index, documents, embedding model, OpenAI client.
-    Returns (faiss_index, documents, embedder, openai_client, error)."""
-    try:
-        if not FAISS_AVAILABLE:
-            return None, None, None, None, (
-                'faiss is not installed. Run: pip install faiss-cpu'
-            )
-        from sentence_transformers import SentenceTransformer
-        from openai import OpenAI
-
-        for fname in ('faiss_index.bin', 'rag_documents.json', 'rag_config.json'):
-            if not os.path.exists(mp(fname)):
-                return None, None, None, None, f'{fname} not found — run 04_nlp_rag.ipynb first.'
-
-        if not OPENAI_API_KEY:
-            return None, None, None, None, 'OPENAI_API_KEY not set in .env file.'
-
-        idx = _faiss_lib.read_index(mp('faiss_index.bin'))
-        with open(mp('rag_documents.json'), encoding='utf-8') as f:
-            docs = json.load(f)
-        with open(mp('rag_config.json')) as f:
-            config = json.load(f)
-
-        embedder = SentenceTransformer(config.get('embedding_model', 'all-MiniLM-L6-v2'))
-        client   = OpenAI(api_key=OPENAI_API_KEY)
-        return idx, docs, embedder, client, None
-    except Exception as exc:
-        return None, None, None, None, str(exc)
-
-
-@st.cache_data(show_spinner='Loading dataset…')
-def load_dataset():
-    """Load and preprocess used_cars_clean.csv. Returns (df, error)."""
-    try:
-        csv_path = dp('processed', 'used_cars_clean.csv')
-        if not os.path.exists(csv_path):
-            return None, 'used_cars_clean.csv not found — run 01_eda.ipynb first.'
-
-        df = pd.read_csv(csv_path)
-        bool_cols = [c for c in df.columns
-                     if c.startswith(('Fuel_Type_', 'Transmission_', 'Owner_Type_'))]
-        df[bool_cols] = df[bool_cols].replace({'True': 1, 'False': 0}).astype(int)
-        return df, None
-    except Exception as exc:
-        return None, str(exc)
-
+            OPENAI_API_KEY = st.secrets.get('OPENAI_API_KEY', '')
+        except Exception:
+            pass
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Prediction helpers
+# Helper functions — heavy imports are deferred inside each function
 # ═══════════════════════════════════════════════════════════════════════════
+
+def lakh_to_chf(lakh_price: float) -> int:
+    """Convert Indian Lakh INR to CHF, rounded to nearest 10."""
+    return round(lakh_price * 100_000 * 0.011 / 10) * 10
+
+
+def get_brand_list() -> list:
+    """Load brand encoder, extract class names, free encoder immediately."""
+    import joblib
+    enc   = joblib.load(mp('brand_encoder.pkl'))
+    names = list(enc.classes_)
+    del enc
+    gc.collect()
+    return names
+
 
 def cv_predict(image: Image.Image, top_k: int = 3):
-    """Load ResNet18, run inference on image, return (predictions, model).
-    Caller must `del model` and call `gc.collect()` after use."""
+    """
+    Load ResNet18, run inference, return (predictions, model).
+    Caller MUST: del model; gc.collect()
+    """
     import torch
     import torch.nn as nn
     from torchvision import models as tv_models, transforms
 
-    weights_path = os.path.join(os.path.dirname(__file__), '..', 'models', 'car_brand_classifier.pth')
-    names_path   = os.path.join(os.path.dirname(__file__), '..', 'models', 'class_names.json')
+    # Explicitly pin to CPU — MPS (Apple Silicon) causes a fatal segfault
+    device = torch.device('cpu')
 
-    with open(names_path) as f:
+    with open(mp('class_names.json')) as f:
         class_names = json.load(f)
 
     tf = transforms.Compose([
@@ -180,29 +123,41 @@ def cv_predict(image: Image.Image, top_k: int = 3):
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
-    tensor = tf(image.convert('RGB')).unsqueeze(0)
+    tensor = tf(image.convert('RGB')).unsqueeze(0).to(device)
 
     net = tv_models.resnet18(weights=None)
     net.fc = nn.Linear(net.fc.in_features, len(class_names))
-    net.load_state_dict(torch.load(weights_path, map_location='cpu', weights_only=False))
+    net.load_state_dict(
+        torch.load(mp('car_brand_classifier.pth'), map_location=device, weights_only=False)
+    )
+    net = net.to(device)
     net.eval()
 
     with torch.no_grad():
         probs = torch.softmax(net(tensor), dim=1)[0]
     topk = torch.topk(probs, top_k)
-    predictions = [(class_names[i.item()], topk.values[j].item()) for j, i in enumerate(topk.indices)]
+    predictions = [
+        (class_names[i.item()], topk.values[j].item())
+        for j, i in enumerate(topk.indices)
+    ]
     return predictions, net
 
 
-def ml_predict(
-        brand: str, year: int, km_driven: float,
-        fuel_type: str, transmission: str,
-        mileage: float, engine: float, power: float,
-        seats: int, owner_type: str,
-        predictor, scaler, brand_encoder, feature_columns: list) -> float:
-    """Predict resale price (returned in Lakh INR; callers convert to CHF via lakh_to_chf)."""
+def ml_predict(brand, year, km_driven, fuel_type, transmission,
+               mileage, engine, power, seats, owner_type) -> float:
+    """
+    Load ML models, predict resale price in Lakh INR, delete models before return.
+    All sklearn/joblib objects are freed inside this function.
+    """
+    import joblib
+
+    predictor     = joblib.load(mp('price_predictor.pkl'))
+    scaler        = joblib.load(mp('scaler.pkl'))
+    brand_encoder = joblib.load(mp('brand_encoder.pkl'))
+    with open(dp('feature_columns.json')) as f:
+        feature_columns = json.load(f)
+
     car_age = 2024 - year
-    # Scaler fit order: km_driven, engine, power, mileage, car_age
     raw_num = np.array([[km_driven, engine, power, mileage, car_age]], dtype=float)
     scaled  = scaler.transform(raw_num)[0]
     km_s, eng_s, pwr_s, mil_s, age_s = scaled
@@ -230,20 +185,43 @@ def ml_predict(
         'Owner_Type_Third':          float(owner_type == 'Third'),
     }])[feature_columns]
 
-    return round(float(predictor.predict(row)[0]), 2)
+    price = round(float(predictor.predict(row)[0]), 2)
+
+    del predictor, scaler, brand_encoder
+    gc.collect()
+    return price
 
 
-def rag_retrieve(query: str, faiss_idx, docs: list, embedder, k: int = 3) -> list:
-    """Return top-k most relevant documents for query."""
-    q_vec = embedder.encode([query], convert_to_numpy=True).astype('float32')
-    _faiss_lib.normalize_L2(q_vec)
-    _, indices = faiss_idx.search(q_vec, k)
-    return [docs[i] for i in indices[0] if i < len(docs)]
+def load_rag() -> dict:
+    """
+    Load all RAG components. Returns a dict stored in session_state['rag'].
+    Called at most once per session.
+    """
+    import faiss
+    from sentence_transformers import SentenceTransformer
+    from openai import OpenAI
+
+    idx = faiss.read_index(mp('faiss_index.bin'))
+    with open(mp('rag_documents.json'), encoding='utf-8') as f:
+        docs = json.load(f)
+    with open(mp('rag_config.json')) as f:
+        config = json.load(f)
+    # device='cpu' — MPS (Apple Silicon GPU) segfaults during encode() on this torch version
+    embedder = SentenceTransformer(config.get('embedding_model', 'all-MiniLM-L6-v2'), device='cpu')
+    client   = OpenAI(api_key=OPENAI_API_KEY)
+    return {'idx': idx, 'docs': docs, 'embedder': embedder, 'client': client}
 
 
-def rag_generate(question: str, context_docs: list, openai_client) -> str:
-    """Generate GPT answer grounded in retrieved context (XML-tagged prompt)."""
-    context_text = '\n\n'.join(context_docs)
+def rag_answer(question: str, rag: dict, k: int = 3):
+    """Retrieve top-k docs then generate a grounded answer. Returns (answer, context_docs)."""
+    import faiss as _faiss
+
+    q_vec = rag['embedder'].encode([question], convert_to_numpy=True).astype('float32')
+    _faiss.normalize_L2(q_vec)
+    _, indices     = rag['idx'].search(q_vec, k)
+    context_docs   = [rag['docs'][i] for i in indices[0] if i < len(rag['docs'])]
+    context_text   = '\n\n'.join(context_docs)
+
     system_msg = (
         'You are an expert car advisor assistant specialising in the Indian used-car market. '
         'Provide concise, accurate, and helpful answers based on the provided context.'
@@ -255,7 +233,7 @@ def rag_generate(question: str, context_docs: list, openai_client) -> str:
         'If the context lacks information, share general knowledge clearly.'
     )
     try:
-        response = openai_client.chat.completions.create(
+        resp = rag['client'].chat.completions.create(
             model='gpt-3.5-turbo',
             messages=[
                 {'role': 'system', 'content': system_msg},
@@ -264,21 +242,32 @@ def rag_generate(question: str, context_docs: list, openai_client) -> str:
             max_tokens=350,
             temperature=0.3,
         )
-        return response.choices[0].message.content.strip()
+        answer = resp.choices[0].message.content.strip()
     except Exception as exc:
-        return f'[API Error] {exc}'
+        answer = f'[API Error] {exc}'
 
-
-def rag_full(question: str, faiss_idx, docs, embedder, openai_client, k: int = 3):
-    """Full RAG pipeline: retrieve → augment → generate. Returns (answer, context_docs)."""
-    context_docs = rag_retrieve(question, faiss_idx, docs, embedder, k)
-    answer       = rag_generate(question, context_docs, openai_client)
     return answer, context_docs
 
 
-def lakh_to_chf(lakh_price: float) -> int:
-    # 1 Lakh = 100,000 INR, 1 INR = 0.011 CHF; round to nearest 10 CHF
-    return round(lakh_price * 100_000 * 0.011 / 10) * 10
+def ensure_rag() -> bool:
+    """
+    Load RAG into session_state['rag'] if not already loaded.
+    Returns True on success, False on failure (error stored in session_state['rag_error']).
+    """
+    if 'rag' in st.session_state:
+        return True
+    if 'rag_error' in st.session_state:
+        return False
+    if not OPENAI_API_KEY:
+        st.session_state['rag_error'] = 'OPENAI_API_KEY is not set.'
+        return False
+    try:
+        with st.spinner('Loading AI advisor (one-time setup)…'):
+            st.session_state['rag'] = load_rag()
+        return True
+    except Exception as exc:
+        st.session_state['rag_error'] = str(exc)
+        return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -312,7 +301,7 @@ with st.sidebar:
     )
     st.caption('💱 Prices converted from Indian market data to CHF')
     st.divider()
-    st.caption('ZHAW AI Applications Project · 2024')
+    st.caption('ZHAW AI Applications Project · 2026')
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -324,91 +313,98 @@ st.markdown('*AI-powered brand recognition, price prediction, and buying advice 
 st.divider()
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Tabs
+# Tabs — all dynamic content is wrapped in a catch-all try/except
 # ═══════════════════════════════════════════════════════════════════════════
 
-tab1, tab2, tab3, tab4 = st.tabs([
-    '🔍 Car Analyzer',
-    '💬 Car Advisor Chatbot',
-    '📊 Dataset Insights',
-    'ℹ️ About',
-])
+try:
+    tab1, tab2, tab3, tab4 = st.tabs([
+        '🔍 Car Analyzer',
+        '💬 Car Advisor Chatbot',
+        '📊 Dataset Insights',
+        'ℹ️ About',
+    ])
 
+    # ─────────────────────────────────────────────────────────────────────
+    # TAB 1 — Car Analyzer
+    # ─────────────────────────────────────────────────────────────────────
 
-# ═══════════════════════════════════════════════════════════════════════════
-# TAB 1 — Car Analyzer
-# ═══════════════════════════════════════════════════════════════════════════
+    with tab1:
+        st.header('Car Analyzer')
+        st.markdown(
+            'Upload a car photo to identify the brand, enter the car\'s specs, '
+            'then get an estimated resale price and AI explanation.'
+        )
 
-with tab1:
-    st.header('Car Analyzer')
-    st.markdown(
-        'Upload a car photo to identify the brand, enter the car\'s specs, '
-        'then get an estimated resale price and AI explanation.'
-    )
+        uploaded_file = st.file_uploader(
+            'Upload a car image (JPG or PNG)',
+            type=['jpg', 'jpeg', 'png'],
+            label_visibility='visible',
+        )
 
-    uploaded_file = st.file_uploader(
-        'Upload a car image (JPG or PNG)',
-        type=['jpg', 'jpeg', 'png'],
-        label_visibility='visible',
-    )
+        if uploaded_file is not None:
+            image = Image.open(uploaded_file)
 
-    if uploaded_file is not None:
-        image = Image.open(uploaded_file)
+            col_img, col_cv = st.columns([1, 1], gap='large')
 
-        col_img, col_cv = st.columns([1, 1], gap='large')
+            with col_img:
+                st.image(image, caption='Uploaded car image', use_column_width=True)
 
-        with col_img:
-            st.image(image, caption='Uploaded car image', use_column_width=True)
+            with col_cv:
+                st.subheader('Brand Recognition')
+                if st.button('🔍 Analyze Car', type='primary', use_container_width=True):
+                    try:
+                        # Unload RAG before loading CV to keep both out of memory simultaneously
+                        if 'rag' in st.session_state:
+                            del st.session_state['rag']
+                            gc.collect()
 
-        with col_cv:
-            st.subheader('Brand Recognition')
-            if st.button('🔍 Analyze Car', type='primary', use_container_width=True):
-                try:
-                    with st.spinner('Loading brand classifier and analysing image…'):
-                        predictions, cv_model = cv_predict(image, top_k=3)
-                    del cv_model
-                    gc.collect()
+                        with st.spinner('Loading CV model and analysing image…'):
+                            predictions, cv_model = cv_predict(image, top_k=3)
+                        del cv_model
+                        gc.collect()
 
-                    top_brand, top_conf = predictions[0]
-                    st.success(f'**Identified brand: {top_brand}**')
+                        top_brand, top_conf = predictions[0]
+                        st.success(f'**Identified brand: {top_brand}**')
 
-                    st.markdown('**Top-3 predictions:**')
-                    for brand, conf in predictions:
-                        st.markdown(f'`{brand}`')
-                        st.progress(float(conf), text=f'{conf:.1%}')
+                        st.markdown('**Top-3 predictions:**')
+                        for brand_name, conf in predictions:
+                            st.markdown(f'`{brand_name}`')
+                            st.progress(float(conf), text=f'{conf:.1%}')
 
-                    st.session_state['cv_brand'] = top_brand
-                    st.session_state['cv_conf']  = top_conf
-                    st.session_state['cv_done']  = True
-                except Exception as exc:
-                    st.error(f'Brand recognition failed: {exc}')
+                        st.session_state['cv_brand'] = top_brand
+                        st.session_state['cv_conf']  = top_conf
+                        st.session_state['cv_done']  = True
+                    except Exception as exc:
+                        st.error(f'Brand recognition failed: {exc}')
 
-        # ── Price estimation section ────────────────────────────────────────
-        if st.session_state.get('cv_done'):
-            st.divider()
-            st.subheader('Price Estimation')
-            st.markdown('Fill in the car\'s details below, then click **Estimate Price**.')
+            # ── Price estimation ──────────────────────────────────────────
+            if st.session_state.get('cv_done'):
+                st.divider()
+                st.subheader('Price Estimation')
+                st.markdown('Fill in the car\'s details below, then click **Estimate Price**.')
 
-            predictor, scaler, brand_encoder, feature_columns, ml_err = load_ml_models()
-
-            if ml_err:
-                st.error(f'ML model error: {ml_err}')
-            else:
-                ml_brands = list(brand_encoder.classes_)
+                # Cache the brand list (list of strings, tiny) in session_state
+                if 'ml_brands' not in st.session_state:
+                    try:
+                        st.session_state['ml_brands'] = get_brand_list()
+                    except Exception:
+                        st.session_state['ml_brands'] = []
+                ml_brands = st.session_state['ml_brands'] or [
+                    'Audi', 'BMW', 'Honda', 'Hyundai', 'Maruti', 'Toyota'
+                ]
 
                 col1, col2, col3 = st.columns(3)
 
                 with col1:
                     st.markdown('**General**')
-                    # Try to pre-select the CV brand if it exists in ML brands
-                    cv_brand = st.session_state.get('cv_brand', ml_brands[0])
-                    default_brand_idx = ml_brands.index(cv_brand) if cv_brand in ml_brands else 0
-                    brand_sel  = st.selectbox('Brand', ml_brands, index=default_brand_idx)
-                    year       = st.slider('Manufacturing Year', 2000, 2024, 2018, step=1)
-                    km_driven  = st.slider('Kilometers Driven', 0, 300_000, 50_000, step=1_000,
-                                           format='%d km')
-                    owner_type = st.selectbox('Owner Type',
-                                              ['First', 'Second', 'Third', 'Fourth & Above'])
+                    cv_brand    = st.session_state.get('cv_brand', ml_brands[0])
+                    default_idx = ml_brands.index(cv_brand) if cv_brand in ml_brands else 0
+                    brand_sel   = st.selectbox('Brand', ml_brands, index=default_idx)
+                    year        = st.slider('Manufacturing Year', 2000, 2024, 2018, step=1)
+                    km_driven   = st.slider('Kilometers Driven', 0, 300_000, 50_000, step=1_000,
+                                            format='%d km')
+                    owner_type  = st.selectbox('Owner Type',
+                                               ['First', 'Second', 'Third', 'Fourth & Above'])
 
                 with col2:
                     st.markdown('**Fuel & Transmission**')
@@ -427,29 +423,26 @@ with tab1:
                                               help='Maximum power in brake horsepower.')
 
                 if st.button('💰 Estimate Price', type='primary', use_container_width=True):
-                    with st.spinner('Predicting resale price…'):
-                        try:
+                    try:
+                        with st.spinner('Loading ML model and predicting price…'):
                             price = ml_predict(
                                 brand_sel, year, km_driven, fuel_type, transmission,
                                 mileage, engine, power, seats, owner_type,
-                                predictor, scaler, brand_encoder, feature_columns,
                             )
-                            gc.collect()
-                            st.session_state['last_price']      = price
-                            st.session_state['last_brand_sel']  = brand_sel
-                            st.session_state['last_specs']      = dict(
-                                year=year, km_driven=km_driven, fuel_type=fuel_type,
-                                transmission=transmission, mileage=mileage,
-                                engine=engine, power=power, seats=seats,
-                            )
-                        except Exception as exc:
-                            st.error(f'Price prediction failed: {exc}')
-                            st.stop()
+                        st.session_state['last_price']     = price
+                        st.session_state['last_brand_sel'] = brand_sel
+                        st.session_state['last_specs']     = dict(
+                            year=year, km_driven=km_driven, fuel_type=fuel_type,
+                            transmission=transmission, mileage=mileage,
+                            engine=engine, power=power, seats=seats,
+                        )
+                    except Exception as exc:
+                        st.error(f'Price prediction failed: {exc}')
 
                 if 'last_price' in st.session_state:
-                    price       = st.session_state['last_price']
-                    brand_used  = st.session_state.get('last_brand_sel', brand_sel)
-                    specs       = st.session_state.get('last_specs', {})
+                    price      = st.session_state['last_price']
+                    brand_used = st.session_state.get('last_brand_sel', brand_sel)
+                    specs      = st.session_state.get('last_specs', {})
 
                     st.divider()
                     m1, m2, m3, m4 = st.columns(4)
@@ -461,296 +454,283 @@ with tab1:
                     # RAG explanation
                     st.divider()
                     st.subheader('AI Explanation')
-                    faiss_idx, docs, embedder, openai_client, rag_err = load_rag_components()
-
-                    if rag_err:
-                        st.warning(f'AI explanation unavailable: {rag_err}')
-                    else:
+                    if not OPENAI_API_KEY:
+                        st.warning('Set OPENAI_API_KEY to enable AI explanations.')
+                    elif ensure_rag():
                         with st.spinner('Generating AI explanation…'):
                             rag_query = (
                                 f'I have a {specs.get("year")} {brand_used} with '
                                 f'{specs.get("km_driven"):,} km driven, '
-                                f'{specs.get("fuel_type")} fuel, {specs.get("transmission")} transmission, '
-                                f'{specs.get("engine")} CC engine, {specs.get("power")} BHP power. '
+                                f'{specs.get("fuel_type")} fuel, '
+                                f'{specs.get("transmission")} transmission, '
+                                f'{specs.get("engine")} CC engine, '
+                                f'{specs.get("power")} BHP power. '
                                 f'The estimated resale price is CHF {lakh_to_chf(price):,.0f}. '
                                 f'Is this price fair and should I buy it?'
                             )
-                            answer, context_docs = rag_full(
-                                rag_query, faiss_idx, docs, embedder, openai_client
-                            )
-
+                            answer, context_docs = rag_answer(rag_query, st.session_state['rag'])
                         st.info(answer)
                         with st.expander('View retrieved knowledge-base documents'):
                             for j, doc in enumerate(context_docs, 1):
                                 st.markdown(f'**[{j}]** {doc}')
-    else:
-        st.info('Upload a car image above to get started with the analysis.')
+                    else:
+                        st.warning(
+                            f'AI explanation unavailable: {st.session_state.get("rag_error", "unknown error")}'
+                        )
+        else:
+            st.info('Upload a car image above to get started with the analysis.')
 
+    # ─────────────────────────────────────────────────────────────────────
+    # TAB 2 — Car Advisor Chatbot
+    # ─────────────────────────────────────────────────────────────────────
 
-# ═══════════════════════════════════════════════════════════════════════════
-# TAB 2 — Car Advisor Chatbot
-# ═══════════════════════════════════════════════════════════════════════════
-
-with tab2:
-    st.header('Car Advisor Chatbot')
-    st.markdown(
-        'Ask any car-related question. The chatbot retrieves relevant facts from our '
-        'knowledge base and uses GPT-3.5-turbo to generate a grounded answer.'
-    )
-
-    faiss_idx, docs, embedder, openai_client, rag_err = load_rag_components()
-
-    if rag_err:
-        st.error(f'Chatbot unavailable: {rag_err}')
-        st.info(
-            'To enable the chatbot:\n'
-            '1. Make sure `OPENAI_API_KEY` is set in your `.env` file.\n'
-            '2. Run `04_nlp_rag.ipynb` to build the FAISS knowledge base.\n'
-            '3. Restart the Streamlit app.'
+    with tab2:
+        st.header('Car Advisor Chatbot')
+        st.markdown(
+            'Ask any car-related question. The chatbot retrieves relevant facts from our '
+            'knowledge base and uses GPT-3.5-turbo to generate a grounded answer.'
         )
-    else:
-        # Example questions
-        st.markdown('**Quick questions — click to ask:**')
-        example_qs = [
-            'What should I look for when buying a used car?',
-            'Is a diesel or petrol car better for city driving?',
-            'How does car age affect resale value?',
-        ]
-        q_cols = st.columns(3)
-        for i, (col, q) in enumerate(zip(q_cols, example_qs)):
-            with col:
-                if st.button(q, key=f'ex_q_{i}', use_container_width=True):
-                    st.session_state['pending_chat'] = q
 
-        st.divider()
+        # Load RAG on first visit to this tab; cached in session_state afterwards
+        rag_ok = ensure_rag()
 
-        # Initialise chat history
-        if 'chat_history' not in st.session_state:
-            st.session_state.chat_history = []
-
-        # Render existing messages
-        for msg in st.session_state.chat_history:
-            with st.chat_message(msg['role']):
-                st.markdown(msg['content'])
-                if msg['role'] == 'assistant' and msg.get('context'):
-                    with st.expander('View source documents'):
-                        for j, doc in enumerate(msg['context'], 1):
-                            st.markdown(f'**[{j}]** {doc}')
-
-        # Consume pending question (from button click) or chat input
-        pending    = st.session_state.pop('pending_chat', None)
-        user_input = st.chat_input('Ask a car question…') or pending
-
-        if user_input:
-            st.session_state.chat_history.append({'role': 'user', 'content': user_input})
-            with st.chat_message('user'):
-                st.markdown(user_input)
-
-            with st.chat_message('assistant'):
-                with st.spinner('Thinking…'):
-                    answer, context_docs = rag_full(
-                        user_input, faiss_idx, docs, embedder, openai_client
-                    )
-                st.markdown(answer)
-                with st.expander('View source documents'):
-                    for j, doc in enumerate(context_docs, 1):
-                        st.markdown(f'**[{j}]** {doc}')
-
-            st.session_state.chat_history.append({
-                'role':    'assistant',
-                'content': answer,
-                'context': context_docs,
-            })
-
-        # Clear button (only visible when there is history)
-        if st.session_state.get('chat_history'):
-            st.markdown('')
-            if st.button('🗑️ Clear conversation', key='clear_chat'):
-                st.session_state.chat_history = []
-                st.rerun()
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# TAB 3 — Dataset Insights
-# ═══════════════════════════════════════════════════════════════════════════
-
-with tab3:
-    st.header('Dataset Insights')
-    st.markdown('Explore the Indian used-car dataset that powers the ML price prediction model.')
-
-    df, data_err = load_dataset()
-
-    if data_err:
-        st.error(f'Dataset error: {data_err}')
-    else:
-        # Decode Brand integers to readable names using brand_encoder
-        _, _, brand_encoder, _, ml_err = load_ml_models()
-        if not ml_err and brand_encoder is not None:
-            brand_list = list(brand_encoder.classes_)
-            df = df.copy()
-            df['Brand_Name'] = df['Brand'].apply(
-                lambda x: brand_list[int(x)] if int(x) < len(brand_list) else f'Brand {int(x)}'
+        if not rag_ok:
+            st.error(f'Chatbot unavailable: {st.session_state.get("rag_error", "unknown error")}')
+            st.info(
+                'To enable the chatbot:\n'
+                '1. Set `OPENAI_API_KEY` in `.env` or HuggingFace Secrets.\n'
+                '2. Run `04_nlp_rag.ipynb` to build the FAISS knowledge base.\n'
+                '3. Restart the app.'
             )
         else:
-            df = df.copy()
-            df['Brand_Name'] = df['Brand'].astype(int).astype(str)
+            rag = st.session_state['rag']
 
-        # Derive readable Fuel_Type column from boolean dummies
-        df['Fuel_Type'] = 'Other / CNG'
-        df.loc[df['Fuel_Type_Diesel'] == 1, 'Fuel_Type'] = 'Diesel'
-        df.loc[df['Fuel_Type_Petrol'] == 1, 'Fuel_Type'] = 'Petrol'
+            st.markdown('**Quick questions — click to ask:**')
+            example_qs = [
+                'What should I look for when buying a used car?',
+                'Is a diesel or petrol car better for city driving?',
+                'How does car age affect resale value?',
+            ]
+            q_cols = st.columns(3)
+            for i, (col, q) in enumerate(zip(q_cols, example_qs)):
+                with col:
+                    if st.button(q, key=f'ex_q_{i}', use_container_width=True):
+                        st.session_state['pending_chat'] = q
 
-        # Convert raw prices to CHF for all chart and metric displays
-        df['Price_CHF'] = df['Price'].apply(lakh_to_chf)
+            st.divider()
 
-        # ── Key metrics row ────────────────────────────────────────────────
-        total_cars = len(df)
-        avg_price  = df['Price'].mean()
-        top_brand  = df['Brand_Name'].value_counts().index[0]
-        top_fuel   = df['Fuel_Type'].value_counts().index[0]
+            if 'chat_history' not in st.session_state:
+                st.session_state.chat_history = []
 
-        mc1, mc2, mc3, mc4 = st.columns(4)
-        mc1.metric('Total Listings', f'{total_cars:,}')
-        mc2.metric('Average Resale Price (CHF)', f'CHF {lakh_to_chf(avg_price):,.0f}')
-        mc3.metric('Most Common Brand', top_brand)
-        mc4.metric('Most Common Fuel', top_fuel)
+            for msg in st.session_state.chat_history:
+                with st.chat_message(msg['role']):
+                    st.markdown(msg['content'])
+                    if msg['role'] == 'assistant' and msg.get('context'):
+                        with st.expander('View source documents'):
+                            for j, doc in enumerate(msg['context'], 1):
+                                st.markdown(f'**[{j}]** {doc}')
+
+            pending    = st.session_state.pop('pending_chat', None)
+            user_input = st.chat_input('Ask a car question…') or pending
+
+            if user_input:
+                st.session_state.chat_history.append({'role': 'user', 'content': user_input})
+                with st.chat_message('user'):
+                    st.markdown(user_input)
+
+                with st.chat_message('assistant'):
+                    with st.spinner('Thinking…'):
+                        answer, context_docs = rag_answer(user_input, rag)
+                    st.markdown(answer)
+                    with st.expander('View source documents'):
+                        for j, doc in enumerate(context_docs, 1):
+                            st.markdown(f'**[{j}]** {doc}')
+
+                st.session_state.chat_history.append({
+                    'role':    'assistant',
+                    'content': answer,
+                    'context': context_docs,
+                })
+
+            if st.session_state.get('chat_history'):
+                st.markdown('')
+                if st.button('🗑️ Clear conversation', key='clear_chat'):
+                    st.session_state.chat_history = []
+                    st.rerun()
+
+    # ─────────────────────────────────────────────────────────────────────
+    # TAB 3 — Dataset Insights
+    # ─────────────────────────────────────────────────────────────────────
+
+    with tab3:
+        st.header('Dataset Insights')
+        st.markdown('Explore the Indian used-car dataset that powers the ML price prediction model.')
+
+        try:
+            df = pd.read_csv(dp('used_cars_clean.csv'))
+            bool_cols = [c for c in df.columns
+                         if c.startswith(('Fuel_Type_', 'Transmission_', 'Owner_Type_'))]
+            df[bool_cols] = df[bool_cols].replace({'True': 1, 'False': 0}).astype(int)
+        except Exception as data_err:
+            st.error(f'Dataset error: {data_err}')
+            df = None
+
+        if df is not None:
+            try:
+                brand_list = get_brand_list()
+                df['Brand_Name'] = df['Brand'].apply(
+                    lambda x: brand_list[int(x)] if int(x) < len(brand_list) else f'Brand {int(x)}'
+                )
+            except Exception:
+                df['Brand_Name'] = df['Brand'].astype(int).astype(str)
+
+            df['Fuel_Type'] = 'Other / CNG'
+            df.loc[df['Fuel_Type_Diesel'] == 1, 'Fuel_Type'] = 'Diesel'
+            df.loc[df['Fuel_Type_Petrol'] == 1, 'Fuel_Type'] = 'Petrol'
+            df['Price_CHF'] = df['Price'].apply(lakh_to_chf)
+
+            total_cars = len(df)
+            avg_price  = df['Price'].mean()
+            top_brand  = df['Brand_Name'].value_counts().index[0]
+            top_fuel   = df['Fuel_Type'].value_counts().index[0]
+
+            mc1, mc2, mc3, mc4 = st.columns(4)
+            mc1.metric('Total Listings', f'{total_cars:,}')
+            mc2.metric('Average Resale Price (CHF)', f'CHF {lakh_to_chf(avg_price):,.0f}')
+            mc3.metric('Most Common Brand', top_brand)
+            mc4.metric('Most Common Fuel', top_fuel)
+
+            st.divider()
+
+            st.subheader('Price Distribution')
+            fig_hist = px.histogram(
+                df, x='Price_CHF', nbins=60,
+                title='Distribution of Used Car Resale Prices',
+                labels={'Price_CHF': 'Price (CHF)', 'count': 'Number of Cars'},
+                color_discrete_sequence=['#636EFA'],
+                template='plotly_white',
+            )
+            fig_hist.update_layout(
+                bargap=0.05, xaxis_title='Price (CHF)', yaxis_title='Number of Cars'
+            )
+            st.plotly_chart(fig_hist, use_container_width=True)
+
+            st.subheader('Top 10 Brands by Listing Count')
+            brand_counts = df['Brand_Name'].value_counts().head(10).reset_index()
+            brand_counts.columns = ['Brand', 'Count']
+            fig_brands = px.bar(
+                brand_counts, x='Brand', y='Count',
+                title='Top 10 Car Brands in Dataset',
+                color='Count', color_continuous_scale='Blues',
+                template='plotly_white', text='Count',
+            )
+            fig_brands.update_traces(textposition='outside')
+            fig_brands.update_layout(coloraxis_showscale=False, yaxis_title='Number of Listings')
+            st.plotly_chart(fig_brands, use_container_width=True)
+
+            st.subheader('Price Distribution by Fuel Type')
+            fig_box = px.box(
+                df, x='Fuel_Type', y='Price_CHF',
+                title='Resale Price by Fuel Type',
+                labels={'Price_CHF': 'Price (CHF)', 'Fuel_Type': 'Fuel Type'},
+                color='Fuel_Type',
+                color_discrete_sequence=px.colors.qualitative.Set2,
+                template='plotly_white',
+            )
+            fig_box.update_layout(showlegend=False, yaxis_title='Price (CHF)')
+            st.plotly_chart(fig_box, use_container_width=True)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # TAB 4 — About
+    # ─────────────────────────────────────────────────────────────────────
+
+    with tab4:
+        st.header('About This Project')
+
+        col_left, col_right = st.columns([3, 2], gap='large')
+
+        with col_left:
+            st.subheader('Project Description')
+            st.markdown(
+                'This is a ZHAW university AI course project that demonstrates how three different '
+                'AI techniques can be combined into one coherent, end-to-end pipeline.\n\n'
+                'The application answers a common real-world question:  \n'
+                '**"I have a car photo and some basic specs — what brand is it, '
+                'what is it worth, and should I buy it?"**'
+            )
+
+            st.subheader('Three-Block Architecture')
+            st.markdown(
+                '**Block 1 — Computer Vision (ResNet18)**  \n'
+                'Transfer learning on ImageNet-pretrained ResNet18, fine-tuned on the '
+                'Auto_Bilder dataset. The model classifies car brand from a single image '
+                'across 42 brands with 82.44% top-1 accuracy.\n\n'
+                '**Block 2 — Machine Learning (Random Forest)**  \n'
+                'A Random Forest regressor trained on ~5,700 Indian used-car listings. '
+                'Features include mileage, engine size, power, car age, fuel type, '
+                'transmission, and brand. Achieves R² = 0.91 on the test set. '
+                'Prices are converted from Indian Lakh (₹) to CHF for display.\n\n'
+                '**Block 3 — NLP / RAG (GPT-3.5-turbo + FAISS)**  \n'
+                'Retrieval-Augmented Generation using `all-MiniLM-L6-v2` embeddings '
+                'stored in a FAISS vector index. GPT-3.5-turbo receives the retrieved '
+                'context via XML-tagged prompts and generates grounded, factual answers.'
+            )
+
+            st.subheader('Model Performance')
+            perf_df = pd.DataFrame({
+                'Block':  ['CV (ResNet18)', 'ML (Random Forest)', 'NLP (RAG)'],
+                'Task':   ['Brand Classification', 'Price Prediction (CHF)', 'Question Answering'],
+                'Metric': ['Top-1 Accuracy', 'R² Score', 'Retrieval Model'],
+                'Result': ['82.44 %', '0.91', 'all-MiniLM-L6-v2 + FAISS'],
+            })
+            st.dataframe(perf_df, use_container_width=True, hide_index=True)
+
+        with col_right:
+            st.subheader('Technology Stack')
+            st.markdown(
+                '| Layer | Technology |\n'
+                '|-------|------------|\n'
+                '| CV model | PyTorch + ResNet18 |\n'
+                '| ML model | scikit-learn Random Forest |\n'
+                '| Embeddings | sentence-transformers |\n'
+                '| Vector store | FAISS (IndexFlatIP) |\n'
+                '| LLM | OpenAI GPT-3.5-turbo |\n'
+                '| Frontend | Streamlit |\n'
+                '| Charts | Plotly Express |\n'
+            )
+
+            st.subheader('Integration Flow')
+            st.code(
+                'car_image.jpg  +  user specs\n'
+                '       |\n'
+                '  [Block 1 — CV]\n'
+                '  ResNet18 → brand name\n'
+                '       |\n'
+                '  [Block 2 — ML]\n'
+                '  Random Forest → price (CHF)\n'
+                '       |\n'
+                '  [Block 3 — RAG]\n'
+                '  FAISS retrieve → GPT-3.5-turbo → explanation\n'
+                '       |\n'
+                '  Streamlit UI → user',
+                language='text',
+            )
+
+            st.subheader('Dataset Sources')
+            st.markdown(
+                '- **Image data:** Auto_Bilder (Stanford Cars-style), 42 brands  \n'
+                '- **Tabular data:** Indian Used Car Market, ~5,700 listings  \n'
+                '- **Knowledge base:** Built from dataset statistics + car-buying tips'
+            )
 
         st.divider()
-
-        # ── Price distribution histogram ────────────────────────────────────
-        st.subheader('Price Distribution')
-        fig_hist = px.histogram(
-            df, x='Price_CHF', nbins=60,
-            title='Distribution of Used Car Resale Prices',
-            labels={'Price_CHF': 'Price (CHF)', 'count': 'Number of Cars'},
-            color_discrete_sequence=['#636EFA'],
-            template='plotly_white',
-        )
-        fig_hist.update_layout(
-            bargap=0.05,
-            xaxis_title='Price (CHF)',
-            yaxis_title='Number of Cars',
-        )
-        st.plotly_chart(fig_hist, use_container_width=True)
-
-        # ── Top 10 brands bar chart ─────────────────────────────────────────
-        st.subheader('Top 10 Brands by Listing Count')
-        brand_counts = df['Brand_Name'].value_counts().head(10).reset_index()
-        brand_counts.columns = ['Brand', 'Count']
-
-        fig_brands = px.bar(
-            brand_counts, x='Brand', y='Count',
-            title='Top 10 Car Brands in Dataset',
-            color='Count',
-            color_continuous_scale='Blues',
-            template='plotly_white',
-            text='Count',
-        )
-        fig_brands.update_traces(textposition='outside')
-        fig_brands.update_layout(coloraxis_showscale=False, yaxis_title='Number of Listings')
-        st.plotly_chart(fig_brands, use_container_width=True)
-
-        # ── Price by fuel type boxplot ──────────────────────────────────────
-        st.subheader('Price Distribution by Fuel Type')
-        fig_box = px.box(
-            df, x='Fuel_Type', y='Price_CHF',
-            title='Resale Price by Fuel Type',
-            labels={'Price_CHF': 'Price (CHF)', 'Fuel_Type': 'Fuel Type'},
-            color='Fuel_Type',
-            color_discrete_sequence=px.colors.qualitative.Set2,
-            template='plotly_white',
-        )
-        fig_box.update_layout(showlegend=False, yaxis_title='Price (CHF)')
-        st.plotly_chart(fig_box, use_container_width=True)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# TAB 4 — About
-# ═══════════════════════════════════════════════════════════════════════════
-
-with tab4:
-    st.header('About This Project')
-
-    col_left, col_right = st.columns([3, 2], gap='large')
-
-    with col_left:
-        st.subheader('Project Description')
+        st.subheader('Author & Course')
         st.markdown(
-            'This is a ZHAW university AI course project that demonstrates how three different '
-            'AI techniques can be combined into one coherent, end-to-end pipeline.\n\n'
-            'The application answers a common real-world question:  \n'
-            '**"I have a car photo and some basic specs — what brand is it, '
-            'what is it worth, and should I buy it?"**'
+            '**Course:** AI Applications — ZHAW School of Engineering  \n'
+            '**Year:** 2026  \n'
+            '**Goal:** Demonstrate an end-to-end AI pipeline (image → brand → price → explanation)'
         )
 
-        st.subheader('Three-Block Architecture')
-        st.markdown(
-            '**Block 1 — Computer Vision (ResNet18)**  \n'
-            'Transfer learning on ImageNet-pretrained ResNet18, fine-tuned on the '
-            'Auto_Bilder dataset. The model classifies car brand from a single image '
-            'across 42 brands with 82.44% top-1 accuracy.\n\n'
-            '**Block 2 — Machine Learning (Random Forest)**  \n'
-            'A Random Forest regressor trained on ~5,700 Indian used-car listings. '
-            'Features include mileage, engine size, power, car age, fuel type, '
-            'transmission, and brand. Achieves R² = 0.91 on the test set. '
-            'Prices are converted from Indian Lakh (₹) to CHF for display.\n\n'
-            '**Block 3 — NLP / RAG (GPT-3.5-turbo + FAISS)**  \n'
-            'Retrieval-Augmented Generation using `all-MiniLM-L6-v2` embeddings '
-            'stored in a FAISS vector index. GPT-3.5-turbo receives the retrieved '
-            'context via XML-tagged prompts and generates grounded, factual answers.'
-        )
-
-        st.subheader('Model Performance')
-        perf_df = pd.DataFrame({
-            'Block':  ['CV (ResNet18)', 'ML (Random Forest)', 'NLP (RAG)'],
-            'Task':   ['Brand Classification', 'Price Prediction (CHF)', 'Question Answering'],
-            'Metric': ['Top-1 Accuracy', 'R² Score', 'Retrieval Model'],
-            'Result': ['82.44 %', '0.91', 'all-MiniLM-L6-v2 + FAISS'],
-        })
-        st.dataframe(perf_df, use_container_width=True, hide_index=True)
-
-    with col_right:
-        st.subheader('Technology Stack')
-        st.markdown(
-            '| Layer | Technology |\n'
-            '|-------|------------|\n'
-            '| CV model | PyTorch + ResNet18 |\n'
-            '| ML model | scikit-learn Random Forest |\n'
-            '| Embeddings | sentence-transformers |\n'
-            '| Vector store | FAISS (IndexFlatIP) |\n'
-            '| LLM | OpenAI GPT-3.5-turbo |\n'
-            '| Frontend | Streamlit |\n'
-            '| Charts | Plotly Express |\n'
-        )
-
-        st.subheader('Integration Flow')
-        st.code(
-            'car_image.jpg  +  user specs\n'
-            '       |\n'
-            '  [Block 1 — CV]\n'
-            '  ResNet18 → brand name\n'
-            '       |\n'
-            '  [Block 2 — ML]\n'
-            '  Random Forest → price (CHF)\n'
-            '       |\n'
-            '  [Block 3 — RAG]\n'
-            '  FAISS retrieve → GPT-3.5-turbo → explanation\n'
-            '       |\n'
-            '  Streamlit UI → user',
-            language='text',
-        )
-
-        st.subheader('Dataset Sources')
-        st.markdown(
-            '- **Image data:** Auto_Bilder (Stanford Cars-style), 42 brands  \n'
-            '- **Tabular data:** Indian Used Car Market, ~5,700 listings  \n'
-            '- **Knowledge base:** Built from dataset statistics + car-buying tips'
-        )
-
-    st.divider()
-    st.subheader('Author & Course')
-    st.markdown(
-        '**Course:** AI Applications — ZHAW School of Engineering  \n'
-        '**Year:** 2024  \n'
-        '**Goal:** Demonstrate an end-to-end AI pipeline (image → brand → price → explanation)'
-    )
+except Exception as e:
+    st.error(f"App error: {e}")
+    st.stop()
