@@ -254,7 +254,23 @@ See [`app/app.py`, `cv_predict()` function](app/app.py).
   6. User can continue conversation in the **Car Advisor Chatbot** tab
   7. **Dataset Insights** tab shows interactive Plotly charts of the training data
 
-- **Screenshots:** See the `About` tab in the live app at https://car-advisor-ai.streamlit.app for an integration flow diagram and model performance table.
+### App Screenshots
+
+**Step 1 – Car Brand Recognition (Computer Vision Block)**
+![Car Analyzer](docs/screenshots/car_analyzer.png)
+
+**Step 2 – Price Estimation (ML Numeric Block)**
+![Price Estimation](docs/screenshots/price_estimation.png)
+
+**Step 3 – AI Explanation (NLP/RAG Block)**
+![AI Explanation](docs/screenshots/ai_explanation.png)
+
+**Step 4 – Car Advisor Chatbot (NLP/RAG Block)**
+![Chatbot](docs/screenshots/chatbot.png)
+
+**Step 5 – Dataset Insights (EDA)**
+![Dataset Insights 1](docs/screenshots/dataset_insights_1.png)
+![Dataset Insights 2](docs/screenshots/dataset_insights_2.png)
 
 ---
 
