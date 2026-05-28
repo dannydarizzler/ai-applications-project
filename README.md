@@ -144,9 +144,13 @@ See *Section 7 – Integration with CV Block* in [`notebooks/03_ml_numeric.ipynb
 | 1 | Processed used-car dataset (`used_cars_clean.csv`) | CSV (derived) | 5,737 rows | Source for brand-level summary documents |
 | 2 | Manually authored car-buying tips | Text (authored) | 10 documents | Background knowledge for RAG |
 | 3 | Feature explanation texts | Text (authored) | 15 documents | Explain domain terms (BHP, CC, Lakh) to users |
+| 4 | Wikipedia REST API (10 car brands) | External text (API) | 10 summaries | Real-world brand knowledge for RAG |
 
 #### 2B.2 Preprocessing and Prompt Design
-
+- **External sources:** Wikipedia REST API summaries fetched for top 10 brands 
+  (BMW, Toyota, Honda, Hyundai, Maruti, Volkswagen, Audi, Mercedes-Benz, Ford, Mahindra) 
+  via `requests` library — adds real-world factual grounding to the knowledge base.
+  
 - **Text preprocessing:** Brand summary documents generated programmatically from dataset statistics (mean price, most common fuel type, average km). See *Section 2 – Knowledge Base* in [`notebooks/04_nlp_rag.ipynb`](notebooks/04_nlp_rag.ipynb).
 - **Prompt design:** XML-tagged prompt structure as taught in course:
   ```
@@ -170,6 +174,15 @@ See *Section 7 – Integration with CV Block* in [`notebooks/03_ml_numeric.ipynb
 | 1 | Bare LLM baseline | No context, no system role | GPT-3.5-turbo plain | Generic answer, no domain facts | — |
 | 2 | Add retrieval context | FAISS top-3 docs injected, no system role | GPT-3.5-turbo + RAG | More factual, but less focused | More grounded |
 | 3 | Full RAG with structured prompt | XML tags + system role added | GPT-3.5-turbo + RAG + system role | Concise, factual, correctly scoped | Best quality |
+
+**Integration impact measurement:** The prompt comparison directly demonstrates 
+how RAG context changes the ML price prediction explanation. Prompt A (no context) 
+gives a generic answer with no price reference. Prompt B (RAG, no structure) 
+mentions the price but lacks focus. Prompt C (full RAG + XML structure) explicitly 
+references the predicted CHF price from the ML block, retrieves brand-specific 
+market data from the knowledge base, and generates a grounded buying recommendation — 
+showing a measurable qualitative improvement in answer relevance and factual grounding.
+See *Section 5 – Prompt Comparison* in [`notebooks/04_nlp_rag.ipynb`](notebooks/04_nlp_rag.ipynb).
 
 See *Section 5 – Prompt Comparison* in [`notebooks/04_nlp_rag.ipynb`](notebooks/04_nlp_rag.ipynb).
 

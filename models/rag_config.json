@@ -2,7 +2,7 @@
   "embedding_model": "all-MiniLM-L6-v2",
   "embedding_dim": 384,
   "k_default": 3,
-  "num_documents": 54,
+  "num_documents": 64,
   "index_type": "IndexFlatIP",
   "openai_model": "gpt-3.5-turbo",
   "temperature": 0.3

@@ -24,4 +24,4 @@ sentence-transformers>=3.0.0
 plotly>=5.20.0
 
 # Wikipedia
-echo "wikipedia>=1.4.0" >> app/requirements.txt
+wikipedia>=1.4.0
