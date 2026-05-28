@@ -46,23 +46,25 @@ The third block (NLP/RAG) is implemented as extra work and documented separately
   2. Predicted brand + user-entered specs → ML model estimates the resale price
   3. Predicted brand + price + specs → RAG pipeline generates a natural-language explanation and buying advice
 - **Data and output flow between blocks:**
+
+```text
 car_image.jpg  +  user specs
-|
-[Block 1 — CV]
-ResNet18 → brand name (e.g. "BMW")
-|
-[Block 2 — ML]
-Random Forest → price in CHF (e.g. "CHF 8,250")
-|
-[Block 3 — NLP/RAG]
-FAISS retrieve → GPT-3.5-turbo → explanation + buying advice
-|
-Streamlit UI → user
+       |
+  [Block 1 — CV]
+  ResNet18 → brand name (e.g. "BMW")
+       |
+  [Block 2 — ML]
+  Random Forest → price in CHF (e.g. "CHF 8,250")
+       |
+  [Block 3 — NLP/RAG]
+  FAISS retrieve → GPT-3.5-turbo → explanation + buying advice
+       |
+  Streamlit UI → user
+```
 
 See [`app/app.py`](app/app.py) for the full integration pipeline.
 
 ---
-
 ## 2. Block Documentation
 
 ### 2A. ML Numeric Data
@@ -286,8 +288,9 @@ pip install -r app/requirements.txt
 
 ### API key setup
 Create a `.env` file in the project root:
+```
 OPENAI_API_KEY=sk-proj-your-key-here
-
+```
 ### Data setup
 1. Download [Used Car Auction Prices](https://www.kaggle.com/datasets/tunguz/used-car-auction-prices) → place `train.csv` in `data/raw/used_cars/`
 2. Download [Car Connection Picture Dataset](https://www.kaggle.com/datasets/prondeau/the-car-connection-picture-dataset) → place all images in `data/raw/Auto_Bilder/`
