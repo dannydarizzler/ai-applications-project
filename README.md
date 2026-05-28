@@ -46,21 +46,18 @@ The third block (NLP/RAG) is implemented as extra work and documented separately
   2. Predicted brand + user-entered specs → ML model estimates the resale price
   3. Predicted brand + price + specs → RAG pipeline generates a natural-language explanation and buying advice
 - **Data and output flow between blocks:**
-
-```
 car_image.jpg  +  user specs
-       |
-  [Block 1 — CV]
-  ResNet18 → brand name (e.g. "BMW")
-       |
-  [Block 2 — ML]
-  Random Forest → price in CHF (e.g. "CHF 8,250")
-       |
-  [Block 3 — NLP/RAG]
-  FAISS retrieve → GPT-3.5-turbo → explanation + buying advice
-       |
-  Streamlit UI → user
-```
+|
+[Block 1 — CV]
+ResNet18 → brand name (e.g. "BMW")
+|
+[Block 2 — ML]
+Random Forest → price in CHF (e.g. "CHF 8,250")
+|
+[Block 3 — NLP/RAG]
+FAISS retrieve → GPT-3.5-turbo → explanation + buying advice
+|
+Streamlit UI → user
 
 See [`app/app.py`](app/app.py) for the full integration pipeline.
 
@@ -147,19 +144,15 @@ See *Section 7 – Integration with CV Block* in [`notebooks/03_ml_numeric.ipynb
 | 4 | Wikipedia REST API (10 car brands) | External text (API) | 10 summaries | Real-world brand knowledge for RAG |
 
 #### 2B.2 Preprocessing and Prompt Design
-- **External sources:** Wikipedia REST API summaries fetched for top 10 brands 
-  (BMW, Toyota, Honda, Hyundai, Maruti, Volkswagen, Audi, Mercedes-Benz, Ford, Mahindra) 
-  via `requests` library — adds real-world factual grounding to the knowledge base.
-  
+
 - **Text preprocessing:** Brand summary documents generated programmatically from dataset statistics (mean price, most common fuel type, average km). See *Section 2 – Knowledge Base* in [`notebooks/04_nlp_rag.ipynb`](notebooks/04_nlp_rag.ipynb).
+- **External sources:** Wikipedia REST API summaries fetched for top 10 brands (BMW, Toyota, Honda, Hyundai, Maruti, Volkswagen, Audi, Mercedes-Benz, Ford, Mahindra) via `requests` library — adds real-world factual grounding to the knowledge base. See *Section 2.4 – External Wikipedia Sources* in [`notebooks/04_nlp_rag.ipynb`](notebooks/04_nlp_rag.ipynb).
 - **Prompt design:** XML-tagged prompt structure as taught in course:
-  ```
-  System: You are an expert car advisor assistant.
-  User:
-  <context>{retrieved_documents}</context>
-  <question>{user_question}</question>
-  Answer based on the context. Be concise and helpful.
-  ```
+System: You are an expert car advisor assistant.
+User:
+<context>{retrieved_documents}</context>
+<question>{user_question}</question>
+Answer based on the context. Be concise and helpful.
   See *Section 4 – Prompt Engineering* in [`notebooks/04_nlp_rag.ipynb`](notebooks/04_nlp_rag.ipynb).
 
 #### 2B.3 Approach Selection
@@ -175,23 +168,14 @@ See *Section 7 – Integration with CV Block* in [`notebooks/03_ml_numeric.ipynb
 | 2 | Add retrieval context | FAISS top-3 docs injected, no system role | GPT-3.5-turbo + RAG | More factual, but less focused | More grounded |
 | 3 | Full RAG with structured prompt | XML tags + system role added | GPT-3.5-turbo + RAG + system role | Concise, factual, correctly scoped | Best quality |
 
-**Integration impact measurement:** The prompt comparison directly demonstrates 
-how RAG context changes the ML price prediction explanation. Prompt A (no context) 
-gives a generic answer with no price reference. Prompt B (RAG, no structure) 
-mentions the price but lacks focus. Prompt C (full RAG + XML structure) explicitly 
-references the predicted CHF price from the ML block, retrieves brand-specific 
-market data from the knowledge base, and generates a grounded buying recommendation — 
-showing a measurable qualitative improvement in answer relevance and factual grounding.
-See *Section 5 – Prompt Comparison* in [`notebooks/04_nlp_rag.ipynb`](notebooks/04_nlp_rag.ipynb).
-
-See *Section 5 – Prompt Comparison* in [`notebooks/04_nlp_rag.ipynb`](notebooks/04_nlp_rag.ipynb).
+**Integration impact measurement:** The prompt comparison directly demonstrates how RAG context changes the ML price prediction explanation. Prompt A (no context) gives a generic answer with no price reference. Prompt B (RAG, no structure) mentions the price but lacks focus. Prompt C (full RAG + XML structure) explicitly references the predicted CHF price from the ML block, retrieves brand-specific market data from the knowledge base, and generates a grounded buying recommendation — showing a measurable qualitative improvement in answer relevance and factual grounding. See *Section 5 – Prompt Comparison* in [`notebooks/04_nlp_rag.ipynb`](notebooks/04_nlp_rag.ipynb).
 
 #### 2B.5 Evaluation and Error Analysis
 
 - **Evaluation strategy:** Qualitative comparison of three prompt strategies on identical questions; manual inspection of retrieved documents vs generated answers
 - **Results:** Full RAG with XML-structured prompt (Iteration 3) consistently outperforms bare LLM and unstructured RAG
 - **Error patterns and likely causes:**
-  - Knowledge base is small (~50 documents); rare queries fall back to LLM general knowledge
+  - Knowledge base contains 64 documents (54 domain-specific + 10 Wikipedia summaries); rare queries may still fall back to LLM general knowledge
   - US/European car brands (e.g. Dodge, Ford Mustang) have no matching brand summaries in the knowledge base since the dataset covers only Indian market vehicles
 
 #### 2B.6 Integration with Other Block(s)
@@ -245,6 +229,7 @@ See *Section 4 – Transfer Learning* and *Section 5 – Fine-Tuning* in [`noteb
   - Brands with shared platform DNA (Chevrolet/GMC, Audi/Volkswagen) are frequently confused due to similar visual features
   - Unusual viewpoints (interior shots, close-ups, rear-quarter angles) reduce accuracy — ResNet18's global average pooling loses spatial detail
   - Class imbalance: Chevrolet has ~5,000 images vs smallest brand ~50; model biases toward high-frequency classes when uncertain
+  - **CV↔ML brand mismatch:** The CV model is trained on US-market images (Car Connection dataset) while the ML model uses Indian market data. Brands like Maruti or Tata are rarely predicted by CV but dominate the ML training data. This is documented as a known limitation; the user can manually correct the brand in the price estimation form.
 
 #### 2C.6 Integration with Other Block(s)
 
@@ -301,9 +286,7 @@ pip install -r app/requirements.txt
 
 ### API key setup
 Create a `.env` file in the project root:
-```
 OPENAI_API_KEY=sk-proj-your-key-here
-```
 
 ### Data setup
 1. Download [Used Car Auction Prices](https://www.kaggle.com/datasets/tunguz/used-car-auction-prices) → place `train.csv` in `data/raw/used_cars/`
@@ -336,7 +319,7 @@ streamlit run app.py
 ## 5. Optional Bonus Evidence
 
 - [x] **Third selected block implemented with strong quality** — NLP/RAG block fully implemented with FAISS vector store, sentence-transformers embeddings, and GPT-3.5-turbo; prompt comparison across 3 strategies documented in `notebooks/04_nlp_rag.ipynb`
-- [x] **More than two data sources used with clear added value** — 3 distinct datasets: Car Connection images (CV), Indian Used Car Market CSV (ML), manually authored knowledge base documents (NLP)
+- [x] **More than two data sources used with clear added value** — 4 distinct data sources: Car Connection images (CV), Indian Used Car Market CSV (ML), manually authored knowledge base documents (NLP), Wikipedia REST API summaries for 10 brands (NLP)
 - [x] **Extended evaluation** — Top-1 and Top-3 accuracy for CV; MAE + RMSE + R² for ML; qualitative prompt comparison for NLP; confusion matrix and per-class F1 report
 - [x] **Ethics, bias, or fairness analysis**:
   - Price data is based on the Indian market; CHF conversion uses a fixed approximate rate (1 INR ≈ 0.011 CHF) — prices are indicative only, not financial advice
